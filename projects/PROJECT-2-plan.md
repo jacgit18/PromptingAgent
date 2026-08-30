@@ -1,48 +1,51 @@
-# Project 2: DevDocs — RAG Chat Over Your Documentation
+# Project 2: Real-Time Collaborative Code Editor
 
 ## Goal
-Build a retrieval-augmented generation (RAG) system that lets a user upload technical documents and chat with them in real time, with cited sources, so I can demonstrate a second, genuinely different Claude integration pattern (retrieval + streaming) beyond Project 1's classification/insights pattern.
+Build a multiplayer collaborative code editor (like Figma for code) that demonstrates real-time synchronization, conflict-free collaborative editing, and websocket-based architecture — teaching distributed systems and real-time patterns beyond Project 1's full-stack + Claude integration focus.
 
 ## Architecture
 
 ### High-Level
-The core workflow starts with document ingestion: a user uploads a document (PDF or Markdown), the backend extracts and chunks the text, generates an embedding vector per chunk, and stores both the chunk text and its embedding in Postgres (via the `pgvector` extension). When the user asks a question in the chat UI, the backend embeds the query, runs a similarity search against the stored chunk vectors to retrieve the top-k most relevant chunks, and assembles those chunks plus the question into a prompt for Claude. The response streams back to the frontend token-by-token over Server-Sent Events (SSE) so the chat feels live rather than waiting on a full response, and the UI displays which source chunks the answer was grounded in.
 
-The core components are: a FastAPI backend exposing upload and chat endpoints; PostgreSQL + `pgvector` holding documents, chunks, and their embeddings; an ingestion service that handles chunking and embedding generation; a retrieval service that performs vector similarity search and assembles retrieval context; a streaming chat service that calls Claude with the retrieved context and streams the response back over SSE; and a React frontend (document upload UI, streaming chat interface, citation display linking answers back to source chunks).
+The core workflow: Multiple users connect to a WebSocket server and edit code in shared documents simultaneously. Each keystroke is broadcast to other connected clients in near-real-time, with a conflict-free replicated data type (CRDT) ensuring eventual consistency without explicit conflict resolution. The backend coordinates sessions, persists document history, and manages user presence. A React frontend shows the document, live cursors of other users, and syntax highlighting with language-specific support.
 
-Components talk to each other over well-defined boundaries: React calls FastAPI over REST for upload and document management, and opens an SSE connection for chat so tokens can stream as Claude generates them rather than the frontend polling for a finished response; FastAPI talks to Postgres/pgvector via SQLAlchemy (async) for both metadata and vector similarity queries; the embedding and chat services call Claude and an embedding model via their respective SDKs. This is deliberately different from Project 1's architecture — Project 1's Claude calls were fire-and-forget batch/async jobs with polling; this project's core interaction is a live, streamed, context-grounded conversation, which is a different integration shape worth having in the portfolio.
+Architecture pillars: (1) **Real-time sync layer** using CRDT algorithms (e.g., Yjs) — the technical challenge of distributing edits without server coordination; (2) **Presence & awareness** — showing live cursors, user colors, who's typing; (3) **Durability** — versioned document snapshots and operation logs so edits survive server restarts; (4) **Scalability** — handle many concurrent editors and rooms without connection explosion (connection pooling, room-based subscriptions).
+
+Core components: WebSocket server (Node.js/Express handling pub/sub by room), CRDT library for conflict-free sync, Redis for session/presence tracking, PostgreSQL for durable document storage, React frontend with Monaco editor.
 
 ### Technical Decisions
+
 | Decision | Choice | Why | Alternative |
 |---|---|---|---|
-| Vector store | PostgreSQL + `pgvector` extension | Reuses Postgres operational knowledge from Project 1 while adding vector similarity search; avoids standing up a separate managed vector DB for a portfolio-scale project; keeps chunk metadata and vectors in one transactional store | Pinecone / Chroma — purpose-built and easier to scale, but adds another service to run/pay for when Postgres can do this at this project's scale |
-| Embedding model | Voyage AI embeddings (Anthropic's recommended embedding partner) | Pairs naturally with the Claude ecosystem; strong retrieval quality benchmarks; keeps the "AI vendor surface" coherent with the rest of the stack | OpenAI `text-embedding-3` — comparable quality, but pulls in a second AI vendor for no real benefit here |
-| Streaming transport | Server-Sent Events (SSE) | Chat responses are one-directional (server streams tokens to client); SSE is simpler than WebSockets for this shape, works over plain HTTP, and reconnects automatically | WebSockets — more powerful (bidirectional, lower overhead for high-frequency messages) but unnecessary complexity for a single streaming response per turn |
-| Chunking strategy | Fixed-size chunks with overlap (e.g., ~500 tokens, ~50-token overlap), section-aware where possible (split on headings first) | Simple to implement and reason about; overlap reduces the risk of cutting a relevant fact across a chunk boundary; section-awareness improves retrieval relevance over naive fixed-size splitting alone | Fully semantic/LLM-based chunking — likely higher quality but adds cost and latency to ingestion that isn't justified for a portfolio-scale project |
+| Real-time framework | WebSocket + CRDT (Yjs) | CRDTs guarantee eventual consistency without server arbitration. Yjs has strong ecosystem with Monaco integrations. | Operational transformation (OT) — harder to reason about, requires central authority |
+| Backend | Node.js/Express | Async-first for WebSocket I/O. Solid middleware ecosystem for room management. | Django/Flask — sync-first, need extra tooling |
+| Presence backend | Redis Pub/Sub | Fast ephemeral data. Pub/Sub handles room-based broadcasting efficiently. | In-memory (doesn't scale); database (too slow) |
+| Persistence | PostgreSQL + operation log | ACID for snapshots. Operation log captures every edit for audit/replay. | MongoDB — weaker consistency |
+| Frontend | React + Monaco + Yjs | Monaco is mature, syntax-highlighted, Yjs bindings available. React fits the UI model. | Vanilla JS — too much reinvention |
+| Deployment | Render + Vercel + Redis Cloud | Managed services minimize ops. Good WebSocket support. | Self-hosted (ops burden) |
 
 ### Non-Trivial Challenges
-1. **Chunking and retrieval quality** — Poor chunking (splitting mid-sentence, losing surrounding context, or chunks too large/small) directly degrades answer quality no matter how good the model is. Approach: use section-aware chunking with overlap, tune top-k and chunk size empirically against a small set of test questions with known-good answers, and log retrieved-chunk relevance so bad retrievals are visible and debuggable rather than silently producing weak answers.
-2. **Streaming architecture end-to-end** — Getting tokens from Claude's streaming API through a FastAPI SSE endpoint to a React component that renders incrementally (without flicker, and handling a dropped connection mid-stream) has several places things can silently buffer or break. Approach: use Claude's native streaming API, an async generator in FastAPI that yields SSE-formatted events as they arrive, and a frontend `EventSource`-based hook that appends tokens as they arrive with a clear error/retry state if the stream drops.
-3. **Grounding and citation accuracy** — The system must avoid answering from the model's general knowledge when the document doesn't actually contain the answer, and must correctly attribute claims to the chunks they came from. Approach: an explicit system prompt instructing Claude to answer only from provided context and say so when the context is insufficient; return chunk IDs alongside the generated answer so the frontend can render citations directly tied to retrieved text (not model-hallucinated references); test cases that specifically probe out-of-context questions to confirm the model declines rather than fabricates.
+
+1. **CRDT correctness and conflict-free merging** — Using a CRDT correctly ensures concurrent edits merge without data loss. Approach: Use battle-tested library (Yjs), deeply understand how it prevents conflicts, write tests for concurrent scenarios.
+
+2. **Real-time latency and presence consistency** — Broadcasting every keystroke at scale causes lag. Approach: Differential sync (only deltas), debounce presence updates, Redis Pub/Sub for room sharding.
+
+3. **Network partitions and reconnection** — Users reconnecting should merge offline edits seamlessly. Approach: Client-side operation buffer, server-side acknowledgment tracking, replay unacknowledged ops on reconnect.
 
 ## Success Criteria
-- [ ] Shipped and deployed
-- [ ] Core features working: document upload/ingestion, chunking + embedding pipeline, vector similarity retrieval, streamed chat with citations
-- [ ] Clean code
-- [ ] Tests for critical paths: retrieval relevance on known test questions, streaming endpoint behavior, out-of-context question handling
-- [ ] Can explain the architecture and tradeoffs: pgvector vs. dedicated vector DB, chunking strategy, SSE vs. WebSockets, how grounding is enforced
+- [ ] Shipped (multiple users can edit simultaneously)
+- [ ] Core feature: 2+ users editing shared document in real-time (<500ms latency)
+- [ ] Presence awareness (live cursors, user colors)
+- [ ] Durability (persists across restart)
+- [ ] Tests for CRDT correctness and reconnection
+- [ ] Can explain CRDT vs OT tradeoffs
 
 ## Timeline
-- Week 1: Setup + ingestion — FastAPI scaffold, Postgres + pgvector schema (documents, chunks, embeddings), document upload endpoint, chunking logic
-- Week 2: Embeddings + retrieval — Voyage AI embedding integration, vector similarity search, retrieval service with top-k tuning against test questions
-- Week 3: Streaming chat — Claude streaming integration, SSE endpoint, citation attribution logic, grounding/out-of-context test cases
-- Week 4: Frontend — React chat UI with incremental token rendering, document upload UI, citation display
-- Week 5: Integration, testing, polish — end-to-end testing, error handling (dropped streams, failed ingestion), retrieval quality tuning
-- Week 6: Deploy, document, interview story — deployment, README, final architecture write-up, interview story polish
+- Week 1-2: Backend setup, WebSocket server, Redis Pub/Sub, Yjs integration
+- Week 3: CRDT sync correctness — two-user concurrent edits end-to-end
+- Week 4: Frontend (React + Monaco + Yjs), presence layer
+- Week 5: Persistence (PostgreSQL schema, operation log), reconnection logic
+- Week 6: Polish, testing, deployment
 
 ## Interview Story (Draft)
-"I built a RAG-based chat system that lets users upload technical documents and ask questions with real-time, streamed, cited answers — a deliberately different Claude integration pattern from my first project's async batch categorization work. The main technical challenge was getting retrieval quality right: naive fixed-size chunking was losing context across boundaries and hurting answer relevance, so I moved to section-aware chunking with overlap and tuned retrieval empirically against a set of test questions. I also had to make sure the system was honest about the limits of its context — it needed to decline to answer rather than fabricate when a document didn't actually contain the answer, which I enforced through prompt design and explicit citation-to-chunk attribution rather than trusting the model's own claims. What I learned: retrieval quality, not model quality, is usually the actual bottleneck in a RAG system — the LLM call is the easy part."
-
----
-
-*Once shipped, add a "Final Interview Story" section here reflecting what actually happened during the build.*
+"I built a collaborative code editor where multiple users can edit simultaneously in real-time. The core challenge was correctness — ensuring concurrent edits merge without data loss. I used a CRDT (Yjs) to guarantee eventual consistency without explicit conflict resolution, even over network partitions. That's fundamentally different from my first project's Claude integration focus; here the learning is distributed systems and real-time sync. I also handled presence awareness and reconnection scenarios. What I learned: CRDTs shift the mental model from 'server is truth' to 'all replicas are equally valid and eventually agree.'"
